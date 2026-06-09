@@ -1,0 +1,57 @@
+name: Deploy Next.js to Azure App Service
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v2
+      with:
+        node-version: '20.x'
+    - name: Create env file
+      env:
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          NEXT_PUBLIC_API_URL: "https://pacepilotapitest.azurewebsites.net/api"
+          NEXT_PUBLIC_STRAVA_CLIENT_ID: "51823"
+          NEXT_PUBLIC_STRAVA_REDIRECT_URI: "https://pacepilotfrontendtest.azurewebsites.net/auth/strava"
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+      run: |
+          echo "NEXT_PUBLIC_STRAVA_REDIRECT_URI=${{ env.NEXT_PUBLIC_STRAVA_REDIRECT_URI }}" >> .env
+          echo "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}" >> .env
+          echo "CLERK_SECRET_KEY=${{ env.CLERK_SECRET_KEY }}" >> .env
+          echo "NEXT_PUBLIC_API_URL=${{ env.NEXT_PUBLIC_API_URL }}" >> .env
+          echo "NEXT_PUBLIC_STRAVA_CLIENT_ID=${{ env.NEXT_PUBLIC_STRAVA_CLIENT_ID }}" >> .env
+          echo "STRAVA_CLIENT_SECRET=${{ env.STRAVA_CLIENT_SECRET }}" >> .env
+    - name: npm install, build, and test
+      run: |
+          npm install
+          rm next.config.js
+          cp azure.config.js next.config.js
+          npm run build
+          rm -rf ./build/standalone/public/*
+          mv ./build/static ./build/standalone/build
+          mv ./public ./build/standalone
+  
+    - name: Upload production build artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: nextjs-app
+        path: .next
+
+    - name: Azure Web App Deploy
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: "pacepilotfrontendtest"
+        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        package: ./build/standalone

@@ -1,0 +1,20 @@
+name: Deploy to Azure App Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        default: 'latest'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name:  langsmith-mcp
+          images: ppappregistry.azurecr.io/langsmith-mcp:${{ github.event.inputs.image_tag }}
+          publish-profile: ${{ secrets.AZURE_PROD_WEBAPP_PUBLISH_PROFILE }}
