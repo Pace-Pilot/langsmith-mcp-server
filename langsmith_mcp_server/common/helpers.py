@@ -10,20 +10,7 @@ from uuid import UUID
 from fastmcp.server import Context
 from langsmith import Client
 
-# Import context variables from middleware
-try:
-    from langsmith_mcp_server.middleware import (
-        api_key_context,
-        endpoint_context,
-        workspace_id_context,
-    )
-except ImportError:
-    # Fallback if middleware not available
-    from contextvars import ContextVar
-
-    api_key_context: ContextVar[str] = ContextVar("api_key", default="")
-    workspace_id_context: ContextVar[str] = ContextVar("workspace_id", default="")
-    endpoint_context: ContextVar[str] = ContextVar("endpoint", default="")
+DEFAULT_LANGSMITH_ENDPOINT = "https://api.smith.langchain.com"
 
 
 def get_langsmith_client_from_api_key(
@@ -33,8 +20,7 @@ def get_langsmith_client_from_api_key(
     Create a LangSmith client from an API key and optional configuration.
 
     We do not set os.environ (LANGSMITH_API_KEY, etc.) so that concurrent
-    HTTP requests do not overwrite each other's credentials, which can cause
-    403 Forbidden when the wrong key is used.
+    HTTP requests do not overwrite each other's state.
 
     Args:
         api_key: The LangSmith API key (required)
@@ -44,7 +30,6 @@ def get_langsmith_client_from_api_key(
     Returns:
         LangSmith Client instance
     """  # noqa: W293
-    # Initialize the LangSmith client with parameters (no os.environ mutation)
     client_kwargs = {"api_key": api_key}
     if workspace_id:
         client_kwargs["workspace_id"] = workspace_id
@@ -54,17 +39,42 @@ def get_langsmith_client_from_api_key(
     return Client(**client_kwargs)
 
 
+def get_langsmith_credentials_from_env() -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Read the server's LangSmith credentials from the process environment.
+
+    The server talks to LangSmith with its own API key. MCP clients never send a
+    LangSmith API key; over HTTP they authenticate to this server with OAuth (see
+    auth.py), over stdio the process environment is the trust boundary.
+
+    Returns:
+        Tuple of (api_key, workspace_id or None, endpoint or None).
+
+    Raises:
+        ValueError: If LANGSMITH_API_KEY is not set.
+    """
+    api_key = os.environ.get("LANGSMITH_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "LANGSMITH_API_KEY is not set. The server authenticates to LangSmith with its own "
+            "API key from the environment; clients authenticate to the server with OAuth."
+        )
+    workspace_id = os.environ.get("LANGSMITH_WORKSPACE_ID", "").strip() or None
+    endpoint = os.environ.get("LANGSMITH_ENDPOINT", "").strip() or None
+    return api_key, workspace_id, endpoint
+
+
+_CLIENT_STATE_KEY = "__langsmith_client"
+
+
 async def get_client_from_context(ctx: Context) -> Client:
     """
-    Get LangSmith client from API key and optional config using FastMCP context.
+    Get the LangSmith client for the current request.
 
-    Supports both HTTP and STDIO transports:
-    - HTTP: Config extracted from headers (LANGSMITH-API-KEY, etc.) and stored in session
-    - STDIO: Config read from environment variables (LANGSMITH_API_KEY, etc.)
-
-    On first HTTP request, config is extracted from headers and stored in session.
-    On subsequent HTTP requests, config is retrieved from session state.
-    For STDIO, config is always read from environment variables.
+    Credentials come from the environment (LANGSMITH_API_KEY, LANGSMITH_WORKSPACE_ID,
+    LANGSMITH_ENDPOINT) for both HTTP and stdio transports. The Client is created once
+    per request and cached in FastMCP request state so that several tool calls within
+    one request share it (less memory churn and connection buildup under load).
 
     Args:
         ctx: FastMCP context (automatically provided to tools)
@@ -73,86 +83,23 @@ async def get_client_from_context(ctx: Context) -> Client:
         LangSmith Client instance
 
     Raises:
-        ValueError: If API key is not found in headers (HTTP) or environment (STDIO)
+        ValueError: If LANGSMITH_API_KEY is not set.
     """  # noqa: W293
-    # Try to get config from session state (set on first HTTP request)
-    api_key = await ctx.get_state("api_key")
-    workspace_id = (await ctx.get_state("workspace_id")) or None
-    endpoint = (await ctx.get_state("endpoint")) or None
-
-    # If not in session, try to get from context variables (set by middleware for HTTP transport)
-    if not api_key:
-        try:
-            api_key = api_key_context.get("")
-            if api_key:
-                workspace_id = workspace_id_context.get("") or None
-                endpoint = endpoint_context.get("") or None
-                # Store in session for future requests
-                await ctx.set_state("api_key", api_key)
-                if workspace_id:
-                    await ctx.set_state("workspace_id", workspace_id)
-                if endpoint:
-                    await ctx.set_state("endpoint", endpoint)
-        except (RuntimeError, Exception):
-            pass
-
-    # If still not found, try to get from request headers (HTTP transport)
-    if not api_key:
-        try:
-            request = ctx.get_http_request()
-            if request:
-                # HTTP transport: try request.state first (set by middleware), then headers
-                if hasattr(request.state, "api_key") and request.state.api_key:
-                    api_key = request.state.api_key
-                    workspace_id = getattr(request.state, "workspace_id", None) or None
-                    endpoint = getattr(request.state, "endpoint", None) or None
-                else:
-                    # Fall back to headers directly
-                    api_key = request.headers.get("LANGSMITH-API-KEY")
-                    workspace_id = request.headers.get("LANGSMITH-WORKSPACE-ID") or None
-                    endpoint = request.headers.get("LANGSMITH-ENDPOINT") or None
-
-                # Store in session for future requests
-                if api_key:
-                    await ctx.set_state("api_key", api_key)
-                    if workspace_id:
-                        await ctx.set_state("workspace_id", workspace_id)
-                    if endpoint:
-                        await ctx.set_state("endpoint", endpoint)
-        except (RuntimeError, Exception):
-            # STDIO transport: get_http_request() raises exception when no active HTTP request
-            # Fall through to get from environment variables
-            pass
-
-        # If still no api_key (either request was None or we caught exception), try environment
-        if not api_key:
-            # STDIO transport: get from environment variables
-            api_key = os.environ.get("LANGSMITH_API_KEY")
-            workspace_id = os.environ.get("LANGSMITH_WORKSPACE_ID") or None
-            endpoint = os.environ.get("LANGSMITH_ENDPOINT") or None
-
-    if not api_key:
-        raise ValueError(
-            "API key not found. For HTTP transport, provide LANGSMITH-API-KEY header. "
-            "For STDIO transport, set LANGSMITH_API_KEY environment variable."
-        )
-
-    # Reuse the same Client within this request to avoid creating a new one per tool
-    # call (reduces memory churn and connection buildup under load).
-    _cache_key = "__langsmith_client"
-    cached = await ctx.get_state(_cache_key)
+    cached = await ctx.get_state(_CLIENT_STATE_KEY)
     if cached is not None:
         return cached  # type: ignore[return-value]
+
+    api_key, workspace_id, endpoint = get_langsmith_credentials_from_env()
     client = get_langsmith_client_from_api_key(
         api_key, workspace_id=workspace_id, endpoint=endpoint
     )
-    await ctx.set_state(_cache_key, client, serializable=False)
+    await ctx.set_state(_CLIENT_STATE_KEY, client, serializable=False)
     return client
 
 
 async def get_api_key_and_endpoint_from_context(ctx: Context) -> tuple[str, str]:
     """
-    Get API key and endpoint from FastMCP context (same sources as get_client_from_context).
+    Get the server's LangSmith API key and endpoint (same source as get_client_from_context).
     Used by tools that call LangSmith REST APIs directly (e.g. billing/usage).
 
     Args:
@@ -162,12 +109,10 @@ async def get_api_key_and_endpoint_from_context(ctx: Context) -> tuple[str, str]
         Tuple of (api_key, endpoint). endpoint is normalized (no trailing slash).
 
     Raises:
-        ValueError: If API key is not found.
+        ValueError: If LANGSMITH_API_KEY is not set.
     """
-    await get_client_from_context(ctx)  # populates ctx state (api_key, endpoint)
-    api_key = await ctx.get_state("api_key")
-    endpoint = (await ctx.get_state("endpoint")) or "https://api.smith.langchain.com"
-    return (str(api_key), str(endpoint).rstrip("/"))
+    api_key, _, endpoint = get_langsmith_credentials_from_env()
+    return (api_key, (endpoint or DEFAULT_LANGSMITH_ENDPOINT).rstrip("/"))
 
 
 def get_langgraph_app_host_name(run_stats: dict) -> Optional[str]:

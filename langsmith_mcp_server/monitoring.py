@@ -107,6 +107,30 @@ def set_monitoring_session_id(session_id: str) -> None:
     monitoring_session_id_context.set(session_id)
 
 
+def get_monitoring_metadata(session_id: str) -> dict:
+    """
+    Build the run metadata for a traced tool call.
+
+    Always contains ``session_id``. When the request was authenticated with OAuth, also
+    contains ``user_id`` (the Clerk ``sub`` claim) and ``oauth_client_id`` (the CIMD
+    client id of the MCP client), so usage can be analyzed per user and per client.
+    """
+    metadata: dict = {"session_id": session_id}
+    try:
+        from fastmcp.server.dependencies import get_access_token
+
+        token = get_access_token()
+    except Exception:  # no request context (e.g. stdio) or auth not configured
+        token = None
+    if token is not None:
+        claims = token.claims or {}
+        if claims.get("sub"):
+            metadata["user_id"] = claims["sub"]
+        if token.client_id:
+            metadata["oauth_client_id"] = token.client_id
+    return metadata
+
+
 async def run_tool_traced_async(
     tool_name: str,
     session_id: str,
@@ -136,7 +160,7 @@ async def run_tool_traced_async(
 
     return await _traced(
         inputs,
-        langsmith_extra={"metadata": {"session_id": session_id}},
+        langsmith_extra={"metadata": get_monitoring_metadata(session_id)},
     )
 
 
@@ -167,4 +191,4 @@ def run_tool_traced_sync(
     def _traced(inputs: dict) -> T:
         return fn()
 
-    return _traced(inputs, langsmith_extra={"metadata": {"session_id": session_id}})
+    return _traced(inputs, langsmith_extra={"metadata": get_monitoring_metadata(session_id)})

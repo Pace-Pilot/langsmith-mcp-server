@@ -26,23 +26,18 @@ A **hosted version** of the LangSmith MCP Server is available over HTTP-streamab
 - **URL:** `https://langsmith-mcp-server.onrender.com/mcp`
 - **Hosting:** [Render](https://render.com), built from this public repo using the project's Dockerfile.
 
-Use it like any HTTP-streamable MCP server: point your client at the URL and send your LangSmith API key in the `LANGSMITH-API-KEY` header. No local install or Docker required.
+Use it like any HTTP-streamable MCP server: point your client at the URL. The server is protected by **OAuth 2.1** (sign-in through Clerk); your MCP client discovers the OAuth endpoints automatically and opens a browser for you to log in. No API key, headers, local install or Docker required. See [Authentication](#-authentication-http-oauth-21-with-clerk) for what your client needs to support.
 
 **Example (Cursor `mcp.json`):**
 ```json
 {
   "mcpServers": {
     "LangSmith MCP (Hosted)": {
-      "url": "https://langsmith-mcp-server.onrender.com/mcp",
-      "headers": {
-        "LANGSMITH-API-KEY": "lsv2_pt_your_api_key_here"
-      }
+      "url": "https://langsmith-mcp-server.onrender.com/mcp"
     }
   }
 }
 ```
-
-Optional headers: `LANGSMITH-WORKSPACE-ID`, `LANGSMITH-ENDPOINT` (same as in the [Docker Deployment](#-docker-deployment-http-streamable) section below).
 
 > **Note:** This deployed instance is intended for [LangSmith Cloud](https://smith.langchain.com). If you use a **self-hosted** LangSmith instance, run the server yourself and point it at your endpoint—see the [Docker Deployment](#-docker-deployment-http-streamable) section below.
 
@@ -202,17 +197,54 @@ Copy this configuration into Cursor → MCP Settings (replace `/path/to/uvx` wit
 
 ![LangSmith Cursor Integration](docs/assets/cursor_mcp.png)
 
-### 🔧 Headers (tool invocation)
+### 🔐 Authentication (HTTP): OAuth 2.1 with Clerk
 
-When connecting over **HTTP** (e.g. streamable HTTP or a hosted MCP endpoint), the server uses **headers** for authentication and configuration. Your MCP client must send these with each request; no environment variables are required for tool invocation.
+Over **HTTP** (streamable HTTP or a hosted endpoint) the server accepts **only OAuth 2.1 bearer tokens**. API key authentication (the former `LANGSMITH-API-KEY` header) has been removed: a request without a valid token gets `401` with a `WWW-Authenticate` header pointing at the protected-resource metadata, as the MCP authorization spec requires.
 
-| Header | Required | Description |
-|--------|----------|-------------|
-| `LANGSMITH-API-KEY` | ✅ Yes | Your LangSmith API key for tool calls (list prompts, fetch runs, etc.) |
-| `LANGSMITH-WORKSPACE-ID` | ❌ No | Workspace ID for API keys scoped to multiple workspaces |
-| `LANGSMITH-ENDPOINT` | ❌ No | Custom API endpoint URL (for self-hosted or EU region) |
+**What is enabled**
 
-Optional headers used only when [server monitoring](#optional-tool-call-monitoring-to-a-second-langsmith-instance) is enabled (for grouping traces by session):
+| Feature | Status |
+|---------|--------|
+| Authorization code grant + **PKCE (S256)** | ✅ The only way to obtain a token. `/authorize` rejects requests without `code_challenge`; `/token` rejects `authorization_code` exchanges without `code_verifier`. |
+| **Client ID Metadata Documents (CIMD)** | ✅ MCP clients identify themselves with an HTTPS URL that serves their client metadata (`client_id_metadata_document_supported: true`). Token endpoint auth methods: `none`, `private_key_jwt`. |
+| Refresh tokens | ✅ Renew an existing authorization without prompting the user again. |
+| Dynamic Client Registration (RFC 7591) | ❌ Disabled. There is no `/register` endpoint and no `registration_endpoint` in the discovery document. |
+| Using the Clerk client id directly as the MCP `client_id` | ❌ Disabled. Only CIMD client ids are resolved. |
+| Implicit, password, client-credentials, device flows | ❌ Not available. |
+
+Your MCP client must support **CIMD**. Clients that can only do Dynamic Client Registration cannot connect.
+
+**How it works**
+
+The server is an OAuth proxy in front of a single, pre-registered Clerk **OAuth application**. MCP clients run the standard authorization code + PKCE flow against this server (`/.well-known/oauth-authorization-server`, `/authorize`, `/token`); the server completes the upstream flow with Clerk (PKCE is forwarded), issues its own tokens to the client and verifies them against Clerk's introspection endpoint on every request.
+
+The LangSmith API key is now a **server-side** setting (`LANGSMITH_API_KEY`, optionally `LANGSMITH_WORKSPACE_ID` and `LANGSMITH_ENDPOINT`). Every authenticated user shares that key, so only expose the server to people who may act with it in LangSmith.
+
+**Clerk setup**
+
+1. In the Clerk Dashboard open **Configure → OAuth Applications** and create an application for the MCP server.
+2. Set the redirect URI to `https://<your-server>/auth/callback` (or the path in `MCP_OAUTH_REDIRECT_PATH`).
+3. Enable the scopes `openid`, `email`, `profile` (add `offline_access` if Clerk requires it for refresh tokens).
+4. Copy the **client ID** and **client secret**. Dynamic client registration can stay disabled in Clerk; it is not used.
+5. Note your Clerk instance domain (Frontend API host), e.g. `verb-noun-12.clerk.accounts.dev` or `clerk.example.com`.
+
+**Server configuration (environment variables)**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLERK_DOMAIN` | ✅ | Clerk instance domain, e.g. `verb-noun-12.clerk.accounts.dev` |
+| `CLERK_OAUTH_CLIENT_ID` | ✅ | Client ID of the Clerk OAuth application |
+| `CLERK_OAUTH_CLIENT_SECRET` | ✅* | Client secret of the Clerk OAuth application. *May be omitted for a public (PKCE-only) Clerk app; then `MCP_OAUTH_JWT_SIGNING_KEY` is required. |
+| `MCP_BASE_URL` | ✅ | Public URL of this server, e.g. `https://mcp.example.com` (used for discovery metadata, the callback URL and the token audience) |
+| `MCP_OAUTH_JWT_SIGNING_KEY` | ❌ | Secret used to sign the tokens this server issues (default: derived from the client secret) |
+| `MCP_OAUTH_REQUIRED_SCOPES` | ❌ | Space/comma separated scopes (default: `openid email profile`) |
+| `MCP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | ❌ | Comma separated redirect URI patterns MCP clients may use (default: whatever each client's CIMD document lists) |
+| `MCP_OAUTH_REQUIRE_CONSENT` | ❌ | `true` (default), `false`, `remember` or `external` – whether to show the server's own consent page before redirecting to Clerk |
+| `MCP_OAUTH_REDIRECT_PATH` | ❌ | Callback path registered in Clerk (default: `/auth/callback`) |
+
+If none of these are set the HTTP app **refuses to start** instead of running unauthenticated. OAuth state (resolved CIMD clients, encrypted upstream tokens) is kept in FastMCP's encrypted file store on local disk; on ephemeral hosts users simply re-authenticate after a restart.
+
+**Monitoring headers** (optional, only when [server monitoring](#optional-tool-call-monitoring-to-a-second-langsmith-instance) is enabled, for grouping traces by session):
 
 | Header | Description |
 |--------|-------------|
@@ -220,23 +252,25 @@ Optional headers used only when [server monitoring](#optional-tool-call-monitori
 | `x-session-id` | Fallback if `mcp-session-id` is not set |
 | `x-request-id` | Fallback for request-scoped grouping |
 
-**Stdio transport:** When running the server over stdio (e.g. `uvx langsmith-mcp-server`), there are no headers. The server falls back to the **environment variables** `LANGSMITH_API_KEY`, `LANGSMITH_WORKSPACE_ID`, and `LANGSMITH_ENDPOINT` in the process environment so that tool invocation still works.
+When a request is authenticated, traces also carry `user_id` (the Clerk user id) and `oauth_client_id` (the client's CIMD URL).
+
+**Stdio transport:** When running the server over stdio (e.g. `uvx langsmith-mcp-server`), there is no OAuth; the process environment is the trust boundary and `LANGSMITH_API_KEY`, `LANGSMITH_WORKSPACE_ID` and `LANGSMITH_ENDPOINT` are read from it.
 
 ---
 
 ### 🔧 Environment variables
 
-Environment variables are **not** used for tool invocation when using HTTP (headers are). They are used for:
+The server reads its configuration from the environment (a `.env` file at the project root is loaded via `python-dotenv`):
 
-1. **Stdio transport** – fallback for credentials when no headers exist (see above).
-2. **Load tests** – e.g. `tests/load_test_sessions.py` reads `LANGSMITH_API_KEY` from the environment (or a `.env` file at the project root).
+1. **LangSmith credentials** – the server's own key, used for every tool call over both transports.
+2. **OAuth** – see [Authentication](#-authentication-http-oauth-21-with-clerk) (HTTP only).
 3. **Optional server monitoring** – tracing tool calls to a second LangSmith instance (see below).
 
-| Variable | Used for | Description |
+| Variable | Required | Description |
 |----------|----------|-------------|
-| `LANGSMITH_API_KEY` | Stdio fallback, load tests | LangSmith API key (when not provided via headers) |
-| `LANGSMITH_WORKSPACE_ID` | Stdio fallback | Workspace ID (optional) |
-| `LANGSMITH_ENDPOINT` | Stdio fallback | Custom endpoint URL (optional) |
+| `LANGSMITH_API_KEY` | ✅ | LangSmith API key used by the server for all tool calls |
+| `LANGSMITH_WORKSPACE_ID` | ❌ | Workspace ID (for API keys scoped to multiple workspaces) |
+| `LANGSMITH_ENDPOINT` | ❌ | Custom endpoint URL (self-hosted or EU region) |
 
 #### Optional: Tool-call monitoring to a second LangSmith instance
 
@@ -250,7 +284,7 @@ You can log every MCP tool call (with inputs and outputs) to a **separate** Lang
 | `LANGSMITH_MONITORING_PROJECT` | No | Project name for monitoring traces (default: `mcp-server-monitoring`) |
 | `LANGSMITH_TRACING` | Yes (to send traces) | Set to `true` so traces are sent to LangSmith ([custom instrumentation](https://docs.smith.langchain.com)) |
 
-Each tool run is traced with `run_type="tool"` and a **session_id** in metadata (from the `mcp-session-id`, `x-session-id`, or `x-request-id` header when using HTTP, or generated per request).
+Each tool run is traced with `run_type="tool"` and a **session_id** in metadata (from the `mcp-session-id`, `x-session-id`, or `x-request-id` header when using HTTP, or generated per request). Authenticated HTTP requests also add **user_id** (Clerk user id) and **oauth_client_id**.
 
 If you use the **hosted** LangSmith MCP Server, anonymous usage data is sent to a separate LangSmith project so we can iterate and improve the product.
 
@@ -268,39 +302,35 @@ docker build -t langsmith-mcp-server .
 ### Running with Docker
 
 ```bash
-docker run -p 8000:8000 langsmith-mcp-server
+docker run -p 8000:8000 \
+  -e LANGSMITH_API_KEY=lsv2_pt_your_api_key_here \
+  -e CLERK_DOMAIN=verb-noun-12.clerk.accounts.dev \
+  -e CLERK_OAUTH_CLIENT_ID=your_clerk_client_id \
+  -e CLERK_OAUTH_CLIENT_SECRET=your_clerk_client_secret \
+  -e MCP_BASE_URL=http://localhost:8000 \
+  langsmith-mcp-server
 ```
 
-The API key is provided via the `LANGSMITH-API-KEY` header when connecting, so no environment variables are required for HTTP-streamable protocol.
+The container will not start without the OAuth variables (see [Authentication](#-authentication-http-oauth-21-with-clerk)). `MCP_BASE_URL` must be the URL clients use to reach the server; behind a reverse proxy or on a hosting platform set it to the public HTTPS URL and register `<MCP_BASE_URL>/auth/callback` as the redirect URI in Clerk.
 
 ### Connecting with HTTP-Streamable Protocol
 
-Once the Docker container is running, you can connect to it using the HTTP-streamable transport. The server accepts authentication via headers:
+Once the container is running, connect with any MCP client that supports **OAuth 2.1 with CIMD** (Client ID Metadata Documents). On the first request the client receives `401` with a `WWW-Authenticate` header, discovers `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`, runs the authorization code + PKCE flow (you sign in through Clerk) and then sends `Authorization: Bearer <token>` with every request. No headers need to be configured by hand.
 
-**Required header:**
-- `LANGSMITH-API-KEY`: Your LangSmith API key
-
-**Optional headers:**
-- `LANGSMITH-WORKSPACE-ID`: Workspace ID for API keys scoped to multiple workspaces
-- `LANGSMITH-ENDPOINT`: Custom endpoint URL (for self-hosted or EU region)
-
-**Example client configuration:**
+**Example client configuration (token obtained by your client's OAuth flow):**
 ```python
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-headers = {
-    "LANGSMITH-API-KEY": "lsv2_pt_your_api_key_here",
-    # Optional:
-    # "LANGSMITH-WORKSPACE-ID": "your_workspace_id",
-    # "LANGSMITH-ENDPOINT": "https://api.smith.langchain.com",
-}
+headers = {"Authorization": "Bearer <access token issued by the server>"}
 
 async with streamablehttp_client("http://localhost:8000/mcp", headers=headers) as (read, write, _):
     async with ClientSession(read, write) as session:
         await session.initialize()
         # Use the session to call tools, list prompts, etc.
 ```
+
+The MCP Python SDK can also drive the flow for you with `OAuthClientProvider` (pass `client_metadata_url` pointing at your published CIMD document) and hand the resulting `auth` object to `streamablehttp_client`.
 
 ### Cursor Integration
 
@@ -310,32 +340,13 @@ To add the LangSmith MCP Server to Cursor using HTTP-streamable protocol, add th
 {
   "mcpServers": {
     "HTTP-Streamable LangSmith MCP Server": {
-      "url": "http://localhost:8000/mcp",
-      "headers": {
-        "LANGSMITH-API-KEY": "lsv2_pt_your_api_key_here"
-      }
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
 ```
 
-**Optional headers:**
-```json
-{
-  "mcpServers": {
-    "HTTP-Streamable LangSmith MCP Server": {
-      "url": "http://localhost:8000/mcp",
-      "headers": {
-        "LANGSMITH-API-KEY": "lsv2_pt_your_api_key_here",
-        "LANGSMITH-WORKSPACE-ID": "your_workspace_id",
-        "LANGSMITH-ENDPOINT": "https://api.smith.langchain.com"
-      }
-    }
-  }
-}
-```
-
-Make sure the server is running before connecting Cursor to it.
+Cursor will prompt you to sign in through Clerk the first time it connects. Make sure the server is running before connecting Cursor to it.
 
 ### Health Check
 
@@ -395,7 +406,7 @@ You can test the server with [MCP Inspector](https://github.com/modelcontextprot
 
 2. **Connect** in the Inspector:
    - **Stdio:** Choose stdio transport and configure the server command (e.g. `uv run langsmith-mcp-server`) and set `LANGSMITH_API_KEY` in the environment.
-   - **Streamable HTTP:** Start the server first (`uv run uvicorn langsmith_mcp_server.server:app --host 0.0.0.0 --port 8000` or Docker), then choose streamable-http, URL **`http://localhost:8000/mcp`**, and add header **`LANGSMITH-API-KEY`** = your API key.
+   - **Streamable HTTP:** Start the server with the OAuth variables set (`uv run uvicorn langsmith_mcp_server.server:app --host 0.0.0.0 --port 8000` or Docker), then choose streamable-http with URL **`http://localhost:8000/mcp`** and complete the OAuth sign-in. The Inspector must support CIMD; otherwise paste an access token obtained elsewhere as a `Authorization: Bearer ...` header.
 
 ### Load testing
 
@@ -414,7 +425,7 @@ uv run python tests/load_test_sessions.py --sessions 20 --calls-per-session 3
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--url` | `http://localhost:8000/mcp` | MCP endpoint URL |
-| `--api-key` | from `.env` | `LANGSMITH_API_KEY` (or set in project root `.env`) |
+| `--access-token` | from `.env` | OAuth access token issued by the server (`MCP_ACCESS_TOKEN` in project root `.env`) |
 | `--sessions` | 10 | Number of concurrent sessions |
 | `--calls-per-session` | 3 | `list_prompts` calls per session |
 | `--debug` | off | Print step-by-step logs and first error traceback |

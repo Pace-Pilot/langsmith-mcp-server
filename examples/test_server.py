@@ -4,13 +4,12 @@ Test script for LangSmith MCP Server using MCP streamable HTTP client.
 Make sure to:
 1. Install dependencies: pip install mcp langchain-mcp-adapters httpx python-dotenv
 2. Start the server first: uvicorn langsmith_mcp_server.server:app --host 0.0.0.0 --port 8000
-3. Set your LangSmith API key: export LANGSMITH_API_KEY=lsv2_pt_... or in .env file
-4. Optionally set LANGSMITH_WORKSPACE_ID and LANGSMITH_ENDPOINT in .env file
+3. Obtain an OAuth access token from the server (authorization code + PKCE via Clerk)
+   and set it: export MCP_ACCESS_TOKEN=... or put it in a .env file
 
-The server accepts these headers:
-- LANGSMITH-API-KEY (required)
-- LANGSMITH-WORKSPACE-ID (optional)
-- LANGSMITH-ENDPOINT (optional)
+The server authenticates clients with OAuth 2.1 only (Authorization: Bearer <token>).
+The LangSmith API key, workspace and endpoint are configured on the server side via
+LANGSMITH_API_KEY, LANGSMITH_WORKSPACE_ID and LANGSMITH_ENDPOINT.
 """
 
 import asyncio
@@ -46,16 +45,14 @@ except ImportError:
 async def test_langsmith_mcp_server():
     """Test the LangSmith MCP server locally."""
     
-    # Get API key from environment
-    api_key = os.getenv("LANGSMITH_API_KEY")
+    # Get OAuth access token from environment
+    access_token = os.getenv("MCP_ACCESS_TOKEN")
     
-    if not api_key:
-        print("⚠️  Warning: Please set your LANGSMITH_API_KEY environment variable")
-        print("   Example: export LANGSMITH_API_KEY=lsv2_pt_...")
-        print("   Or create a .env file with:")
-        print("     LANGSMITH_API_KEY=lsv2_pt_...")
-        print("     LANGSMITH_WORKSPACE_ID=your_workspace_id (optional)")
-        print("     LANGSMITH_ENDPOINT=https://api.smith.langchain.com (optional)")
+    if not access_token:
+        print("⚠️  Warning: Please set your MCP_ACCESS_TOKEN environment variable")
+        print("   Complete the OAuth flow against the server (authorization code + PKCE)")
+        print("   and export the issued access token:")
+        print("     export MCP_ACCESS_TOKEN=...")
         return
     
     base_url = "http://localhost:8000"
@@ -83,22 +80,8 @@ async def test_langsmith_mcp_server():
         print(f"   ⚠️  Error checking server: {e}")
     print()
     
-    # Create headers with API key and optional config
-    headers = {
-        "LANGSMITH-API-KEY": api_key,
-    }
-    
-    # Add optional headers if provided
-    workspace_id = os.getenv("LANGSMITH_WORKSPACE_ID")
-    endpoint = os.getenv("LANGSMITH_ENDPOINT")
-    
-    if workspace_id:
-        headers["LANGSMITH-WORKSPACE-ID"] = workspace_id
-        print(f"   Workspace ID: {workspace_id}")
-    if endpoint:
-        headers["LANGSMITH-ENDPOINT"] = endpoint
-        print(f"   Endpoint: {endpoint}")
-    print()
+    # OAuth bearer token (the only accepted authentication)
+    headers = {"Authorization": f"Bearer {access_token}"}
     
     try:
         # Connect using streamable HTTP client

@@ -11,7 +11,8 @@ Usage:
   uv run python tests/load_test_sessions.py --report load_test_report   # writes load_test_report.json
 
 Environment:
-  Loads .env from project root. LANGSMITH_API_KEY is required (or set --api-key).
+  Loads .env from project root. MCP_ACCESS_TOKEN (an OAuth access token issued by the
+  server) is required, or pass --access-token. The server only accepts OAuth bearer tokens.
 """
 
 import argparse
@@ -143,13 +144,13 @@ def write_report(
 
 async def main(
     url: str,
-    api_key: str,
+    access_token: str,
     sessions: int,
     calls_per_session: int,
     debug: bool = False,
     report_path: Path | None = None,
 ) -> None:
-    headers = {"LANGSMITH-API-KEY": api_key}
+    headers = {"Authorization": f"Bearer {access_token}"}
     print(f"Starting load test: {sessions} sessions, {calls_per_session} list_prompts calls each")
     print(f"URL: {url}")
     if debug:
@@ -244,9 +245,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Session-based MCP load test")
     parser.add_argument("--url", default="http://localhost:8000/mcp", help="MCP endpoint URL")
     parser.add_argument(
-        "--api-key",
-        default=os.environ.get("LANGSMITH_API_KEY"),
-        help="LANGSMITH_API_KEY (default: from .env)",
+        "--access-token",
+        default=os.environ.get("MCP_ACCESS_TOKEN"),
+        help="OAuth access token for the server (default: MCP_ACCESS_TOKEN from .env)",
     )
     parser.add_argument("--sessions", type=int, default=10, help="Number of concurrent sessions")
     parser.add_argument(
@@ -262,13 +263,13 @@ if __name__ == "__main__":
         help="Write JSON report after run (PATH stem used for .json, e.g. load_test_report)",
     )
     args = parser.parse_args()
-    if not args.api_key:
-        print("Set LANGSMITH_API_KEY in .env or pass --api-key", file=sys.stderr)
+    if not args.access_token:
+        print("Set MCP_ACCESS_TOKEN in .env or pass --access-token", file=sys.stderr)
         sys.exit(1)
     asyncio.run(
         main(
             args.url,
-            args.api_key,
+            args.access_token,
             args.sessions,
             args.calls_per_session,
             debug=args.debug,

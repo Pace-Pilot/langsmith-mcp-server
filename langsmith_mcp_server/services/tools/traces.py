@@ -20,21 +20,6 @@ LANGSMITH_LIST_RUNS_MAX_LIMIT = 100
 # Hard cap for trace pagination: pages cannot exceed this character budget
 MAX_CHARS_PER_PAGE_TRACE = 30000
 
-# Import context variables from middleware
-try:
-    from langsmith_mcp_server.middleware import (
-        api_key_context,
-        endpoint_context,
-        workspace_id_context,
-    )
-except ImportError:
-    # Fallback if middleware not available
-    from contextvars import ContextVar
-
-    api_key_context: ContextVar[str] = ContextVar("api_key", default="")
-    workspace_id_context: ContextVar[str] = ContextVar("workspace_id", default="")
-    endpoint_context: ContextVar[str] = ContextVar("endpoint", default="")
-
 
 def fetch_trace_tool(
     client: Client, project_name: str = None, trace_id: str = None

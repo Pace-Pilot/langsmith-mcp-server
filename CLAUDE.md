@@ -38,40 +38,44 @@ The Model Context Protocol (MCP) is an open standard that enables secure connect
 The server is built on FastMCP, a high-performance MCP framework that provides:
 - **Transport Layer**: Uses stdio transport for CLI/desktop integration, HTTP for web-based access
 - **Tool Registration**: Modular system for registering LangSmith tools via `register_tools()`
-- **Middleware Stack**: API key authentication and CORS handling
+- **Authentication (HTTP)**: OAuth 2.1 only, via [auth.py](langsmith_mcp_server/auth.py) (Clerk upstream, CIMD clients, authorization code + PKCE)
+- **Middleware Stack**: request-context middleware (405 on GET /mcp, monitoring session id) and CORS
 - **Error Handling**: Comprehensive exception handling across all operations
 
 ```python
 # Core server initialization (actual implementation)
 mcp = FastMCP("LangSmith API MCP Server")
 
-# Modular registration system (no client parameter - uses middleware)
+# Modular registration system (tools read the server's LangSmith credentials from env)
 register_tools(mcp)
 register_prompts(mcp)      # Currently empty stub
 register_resources(mcp)    # Currently empty stub
+
+# HTTP app is built lazily: `app` is a module-level __getattr__ that calls create_http_app(),
+# which sets mcp.auth from the environment and FAILS CLOSED if OAuth is not configured.
 ```
 
 **Key Architecture Notes:**
-- API keys are handled per-request via [middleware.py](langsmith_mcp_server/middleware.py), not at server initialization
+- **No API key authentication.** The former `LANGSMITH-API-KEY` header is not read anywhere. MCP clients authenticate with OAuth bearer tokens; FastMCP's `RequireAuthMiddleware` (added automatically when `mcp.auth` is set) answers unauthenticated `/mcp` requests with 401 + `WWW-Authenticate`.
+- The LangSmith API key is a **server-side** credential (`LANGSMITH_API_KEY`, optional `LANGSMITH_WORKSPACE_ID`/`LANGSMITH_ENDPOINT`) for both transports. All authenticated users share it.
+- `app` is built lazily (PEP 562 module `__getattr__`) so importing `server.py` for stdio or tests does not require the OAuth environment; `uvicorn langsmith_mcp_server.server:app` triggers `create_http_app()`.
 - The server supports both stdio (CLI) and HTTP transports
 - HTTP mode runs via uvicorn and is configured in the Dockerfile
 - **Client disconnect patch**: [streamable_http_patch.py](langsmith_mcp_server/streamable_http_patch.py) patches the MCP streamable HTTP transport so that when the client (or proxy) closes the connection early, the server logs and continues instead of crashing with `ClosedResourceError` / `BrokenResourceError` (see [Troubleshooting](#7-http-streamable-client-disconnect-crashes)).
 
-#### 2. Authentication & Middleware ([middleware.py](langsmith_mcp_server/middleware.py))
-Request-scoped authentication system that:
-- Extracts `LANGSMITH-API-KEY` header from requests
-- Supports optional `LANGSMITH-WORKSPACE-ID` and `LANGSMITH-ENDPOINT` headers
-- Stores credentials in context variables for access by tools
-- Returns 401 for missing API keys (except /health endpoint)
-- Sets **session/thread id** for monitoring: from `mcp-session-id`, `x-session-id`, or `x-request-id` header, or a generated UUID per request
-- Automatically cleans up context after each request
+#### 2. Authentication ([auth.py](langsmith_mcp_server/auth.py))
+`ClerkCIMDOAuthProvider` subclasses FastMCP's `ClerkProvider` (an `OAuthProxy`) and narrows it:
+- **Enabled**: authorization code grant with **PKCE S256** (the MCP SDK makes `code_challenge` and `code_verifier` mandatory and only accepts `response_type=code`), **CIMD** client ids (HTTPS URL serving the client's metadata; token endpoint auth `none` or `private_key_jwt`), refresh tokens.
+- **Disabled**: Dynamic Client Registration (`client_registration_options.enabled=False`, `/register` route removed, `register_client` raises, no `registration_endpoint` in metadata) and the stock proxy's fallback that accepts the upstream Clerk client id as an MCP client id (`get_client` returns `None` for non-CIMD ids).
+- Discovery metadata (`/.well-known/oauth-authorization-server`) is rebuilt to advertise exactly: `response_types ["code"]`, `grant_types ["authorization_code","refresh_token"]`, `code_challenge_methods ["S256"]`, `token_endpoint_auth_methods ["none","private_key_jwt"]`, `client_id_metadata_document_supported: true`.
+- Upstream: Clerk OAuth application (`https://<CLERK_DOMAIN>/oauth/authorize|token`), PKCE forwarded; tokens verified via Clerk introspection + userinfo on each request.
+- `build_auth_provider_from_env()` reads `CLERK_DOMAIN`, `CLERK_OAUTH_CLIENT_ID`, `CLERK_OAUTH_CLIENT_SECRET` (or `MCP_OAUTH_JWT_SIGNING_KEY`), `MCP_BASE_URL`, and optional `MCP_OAUTH_REQUIRED_SCOPES`, `MCP_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS`, `MCP_OAUTH_REQUIRE_CONSENT`, `MCP_OAUTH_REDIRECT_PATH`. Returns `None` when nothing is set; raises `OAuthConfigError` when partially set.
+- OAuth routes added by FastMCP: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/auth/callback`, `/consent`. `/health` stays public.
 
-```python
-# Context variables used throughout the application
-api_key_context: ContextVar[str]
-workspace_id_context: ContextVar[str]
-endpoint_context: ContextVar[str]
-```
+#### 2a. Request Middleware ([middleware.py](langsmith_mcp_server/middleware.py))
+`RequestContextMiddleware` does no authentication. It:
+- Returns 405 for non-POST/DELETE requests to `/mcp` (e.g. opening it in a browser)
+- Sets the **session/thread id** for monitoring: from `mcp-session-id`, `x-session-id`, or `x-request-id` header, or a generated UUID per request
 
 #### 2b. Optional Monitoring ([monitoring.py](langsmith_mcp_server/monitoring.py))
 When configured, tool calls are traced to a **separate** LangSmith instance for observability (e.g. to monitor MCP usage by session). Configuration is read from environment (e.g. `.env`):
@@ -81,13 +85,14 @@ When configured, tool calls are traced to a **separate** LangSmith instance for 
 - **LANGSMITH_MONITORING_WORKSPACE_ID**: Optional workspace ID
 - **LANGSMITH_MONITORING_PROJECT**: Project name for monitoring traces (default: `mcp-server-monitoring`)
 
-Each tool execution is logged with `run_type="tool"` via LangSmith's `@traceable` decorator; inputs and outputs are captured, and `session_id` is set in run metadata so you can filter/analyze by session. For tracing to be sent, `LANGSMITH_TRACING` must be set to `"true"` (see LangSmith custom instrumentation docs).
+Each tool execution is logged with `run_type="tool"` via LangSmith's `@traceable` decorator; inputs and outputs are captured, and `session_id` is set in run metadata so you can filter/analyze by session. For OAuth-authenticated requests `user_id` (Clerk `sub`) and `oauth_client_id` (CIMD URL) are added via `get_monitoring_metadata()`. For tracing to be sent, `LANGSMITH_TRACING` must be set to `"true"` (see LangSmith custom instrumentation docs).
 
 #### 3. Client Management ([common/helpers.py](langsmith_mcp_server/common/helpers.py))
 Helper functions for LangSmith client creation and management:
-- `get_langsmith_client_from_api_key()`: Creates Client instances from API keys (no `os.environ` mutation; credentials passed explicitly to avoid cross-request races)
-- `get_client_from_context()`: Retrieves client from FastMCP context; reuses one Client per request via request-scoped state to reduce memory churn
-- `get_api_key_and_endpoint_from_context()`: Extracts credentials from context
+- `get_langsmith_credentials_from_env()`: Reads the server's `LANGSMITH_API_KEY` / `LANGSMITH_WORKSPACE_ID` / `LANGSMITH_ENDPOINT`; raises `ValueError` if the key is missing
+- `get_langsmith_client_from_api_key()`: Creates Client instances from an API key (no `os.environ` mutation)
+- `get_client_from_context()`: Returns the request's Client; builds it from env once per request and caches it in FastMCP request state to reduce memory churn
+- `get_api_key_and_endpoint_from_context()`: Returns the server key and normalized endpoint for tools calling REST APIs directly
 - No custom wrapper class - uses standard `langsmith.Client` directly
 
 #### 4. Service Layer Architecture
@@ -157,7 +162,7 @@ All tools are registered in [register_tools.py](langsmith_mcp_server/services/re
 - Several tool implementations exist in [traces.py](langsmith_mcp_server/services/tools/traces.py) but are **NOT registered**:
   - `fetch_trace_tool()` - exists but not exposed as MCP tool
   - `get_project_runs_stats_tool()` - exists but not exposed as MCP tool
-- All tools use `ctx: Context` parameter to access API keys from middleware
+- All tools use `ctx: Context` parameter for request-scoped state (client caching); credentials come from the server environment, never from the client
 
 ---
 
@@ -298,6 +303,7 @@ Provides convenient commands:
 - **Security**: Runs as non-root user (uid 1000)
 - **Entry Point**: `uvicorn langsmith_mcp_server.server:app` on port 8000 (HTTP mode)
 - **Note**: Dockerfile uses HTTP transport, not stdio
+- **Required env at runtime**: `LANGSMITH_API_KEY` plus the OAuth variables (`CLERK_DOMAIN`, `CLERK_OAUTH_CLIENT_ID`, `CLERK_OAUTH_CLIENT_SECRET`, `MCP_BASE_URL`); without OAuth config the app raises `OAuthConfigError` at startup (fail closed). See `.env.example`.
 
 ---
 
@@ -430,7 +436,9 @@ usage = get_billing_usage(
 - **Graceful degradation**: Tools return partial results when possible
 
 ### Security Considerations
-- **API Key Protection**: Keys passed via headers (HTTP) or environment (stdio), never logged
+- **OAuth only over HTTP**: No API key header is accepted; bearer tokens are verified against Clerk on every request. Only authorization code + PKCE (S256) can mint tokens; DCR is disabled so only CIMD clients (with published, verifiable redirect URIs) can authorize.
+- **Shared server credential**: `LANGSMITH_API_KEY` is the server's own key and is never logged; everyone who can sign in through Clerk acts with it. Restrict who can sign in via Clerk, and use a least-privilege LangSmith key.
+- **Fail closed**: the HTTP app refuses to start without OAuth configuration.
 - **Request Isolation**: Each request gets its own context, no cross-contamination
 - **Input Validation**: All user inputs sanitized before passing to LangSmith SDK
 - **Network Security**: Tests run with `--disable-socket` to prevent accidental external calls
@@ -439,7 +447,7 @@ usage = get_billing_usage(
 ### Performance Optimizations
 - **Lazy Client Creation**: LangSmith client only created when needed per request
 - **Request-Scoped Client Reuse**: One Client per request (cached in FastMCP request state) to avoid creating many clients under load and reduce memory churn
-- **No os.environ Mutation**: Credentials are passed explicitly to the Client constructor; we do not set `LANGSMITH_API_KEY` etc. in the process environment, avoiding concurrent-request races that can cause 403 Forbidden
+- **No os.environ Mutation**: Credentials are passed explicitly to the Client constructor; the process environment is only read, never written
 - **Pagination Support**: Large result sets can be paginated (runs, messages, examples)
 - **Efficient Filtering**: Most tools support server-side filtering to reduce data transfer
 - **Connection Reuse**: HTTP client connection pooling via httpx (used by langsmith SDK)
@@ -451,9 +459,10 @@ usage = get_billing_usage(
 ```
 langsmith-mcp-server/
 ├── langsmith_mcp_server/
-│   ├── server.py                 # Main MCP server, FastMCP app, HTTP/stdio setup
+│   ├── server.py                 # Main MCP server, FastMCP app, HTTP/stdio setup (lazy OAuth-protected `app`)
+│   ├── auth.py                   # OAuth 2.1: Clerk proxy, CIMD-only clients, PKCE code flow, DCR disabled
 │   ├── streamable_http_patch.py  # Client-disconnect handling for HTTP streamable transport
-│   ├── middleware.py            # API key authentication middleware
+│   ├── middleware.py            # Request-context middleware (405 on GET /mcp, monitoring session id)
 │   ├── monitoring.py             # Optional: trace tool calls to second LangSmith (session_id, run_type=tool)
 │   ├── common/
 │   │   ├── helpers.py            # Client creation, UUID conversion, utilities
@@ -475,6 +484,9 @@ langsmith-mcp-server/
 ├── tests/
 │   ├── tools/
 │   │   └── test_dataset_tools.py
+│   ├── test_auth.py              # OAuth provider: no DCR, CIMD only, PKCE/code-only enforcement, env config
+│   ├── test_middleware.py
+│   ├── test_helpers.py
 │   └── test_mock.py
 ├── examples/                     # Example scripts showing tool usage
 │   ├── fetch_runs.py
@@ -495,10 +507,12 @@ langsmith-mcp-server/
 
 ### Common Issues
 
-1. **API Key Problems**
-   - Error: "Missing LANGSMITH-API-KEY header" (HTTP) or client initialization failures (stdio)
-   - Solution: Ensure `LANGSMITH_API_KEY` is set in environment or headers
-   - Verify key format: should start with `lsv2_pt_`
+1. **Authentication / credential problems**
+   - Error: `OAuthConfigError` at startup → set `CLERK_DOMAIN`, `CLERK_OAUTH_CLIENT_ID`, `CLERK_OAUTH_CLIENT_SECRET` (or `MCP_OAUTH_JWT_SIGNING_KEY`) and `MCP_BASE_URL`
+   - Error: `401 invalid_token` from `/mcp` → the client has no/expired token; it must run the OAuth flow. Clients that only support Dynamic Client Registration cannot connect (CIMD required).
+   - Error: `/authorize` returns `invalid_request ... not registered` → the `client_id` is not an HTTPS CIMD URL (or the document could not be fetched)
+   - Error: tool returns "LANGSMITH_API_KEY is not set" → set the server-side LangSmith key in the environment
+   - Clerk redirect mismatch → register `<MCP_BASE_URL>/auth/callback` (or `MCP_OAUTH_REDIRECT_PATH`) in the Clerk OAuth application
 
 2. **Import Errors**
    - Error: Module not found
@@ -608,6 +622,12 @@ langsmith-mcp-server/
 ---
 
 ## Recent Architecture Changes
+
+### OAuth-only authentication (November 2026)
+- **Removed**: `LANGSMITH-API-KEY` / `LANGSMITH-WORKSPACE-ID` / `LANGSMITH-ENDPOINT` request headers and the `APIKeyMiddleware`
+- **Added**: [auth.py](langsmith_mcp_server/auth.py) with `ClerkCIMDOAuthProvider` (Clerk upstream, CIMD clients only, authorization code + PKCE S256, refresh tokens; DCR disabled) and env-based configuration
+- **Changed**: LangSmith credentials are server-side env vars for both transports; `server.app` is built lazily and fails closed without OAuth config; monitoring metadata gains `user_id` and `oauth_client_id`
+- **Why**: Clients should authenticate as users through the IdP instead of pasting LangSmith API keys into client configs
 
 ### Unified Pagination in fetch_runs (February 2025)
 - **Removed**: `paginate_runs` tool (was redundant - required trace_id)
