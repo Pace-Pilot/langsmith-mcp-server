@@ -208,7 +208,8 @@ When connecting over **HTTP** (e.g. streamable HTTP or a hosted MCP endpoint), t
 
 | Header | Required | Description |
 |--------|----------|-------------|
-| `LANGSMITH-API-KEY` | ✅ Yes | Your LangSmith API key for tool calls (list prompts, fetch runs, etc.) |
+| `Authorization: Bearer <token>` | ✅ In OAuth mode | OAuth 2.1 access token issued by your Clerk instance (see [Authentication](#-authentication-oauth-21-with-clerk)) |
+| `LANGSMITH-API-KEY` | ✅ In `api_key` mode · ❌ optional in OAuth mode | Your LangSmith API key for tool calls (list prompts, fetch runs, etc.). In OAuth mode it overrides the key resolved from Clerk user metadata / server environment. |
 | `LANGSMITH-WORKSPACE-ID` | ❌ No | Workspace ID for API keys scoped to multiple workspaces |
 | `LANGSMITH-ENDPOINT` | ❌ No | Custom API endpoint URL (for self-hosted or EU region) |
 
@@ -255,6 +256,110 @@ Each tool run is traced with `run_type="tool"` and a **session_id** in metadata 
 If you use the **hosted** LangSmith MCP Server, anonymous usage data is sent to a separate LangSmith project so we can iterate and improve the product.
 
 
+## 🔐 Authentication (OAuth 2.1 with Clerk)
+
+Over HTTP the server can run as a **spec-compliant OAuth 2.1 resource server** following the
+[MCP authorization specification (2026-07-28)](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization),
+with [Clerk](https://clerk.com) as the authorization server / identity provider. The legacy
+`LANGSMITH-API-KEY`-header mode is still available (`MCP_AUTH_MODE=api_key`) and remains the default when
+no Clerk issuer is configured.
+
+**How the roles split**
+
+| Concern | Who | Notes |
+|---------|-----|-------|
+| Authorization-code flow with **PKCE (S256)** | Clerk | The only grant MCP allows for interactive clients; Clerk enforces PKCE for public clients. |
+| **Client registration via CIMD** (Client ID Metadata Documents) | Clerk | DCR (RFC 7591) is deprecated in the 2026-07-28 spec. Clients use their HTTPS metadata URL as `client_id`; Clerk fetches it. |
+| Consent screen, token issuance, refresh | Clerk | Access tokens are JWTs (RFC 9068) signed with your instance's JWKS. |
+| **Protected Resource Metadata** (RFC 9728) | This server | `GET /.well-known/oauth-protected-resource/mcp` (path-based, per RFC 9728 §3.1) plus a root-level copy. Lists Clerk in `authorization_servers`. |
+| `401` + `WWW-Authenticate: Bearer resource_metadata="…", scope="…"` | This server | Tells clients where to discover the authorization server and which scopes to request. |
+| `403 insufficient_scope` | This server | When `MCP_OAUTH_REQUIRED_SCOPES` are missing from a valid token (step-up). |
+| **Token validation** (signature, `iss`, `exp`, **`aud`**) | This server | `aud` must equal this server's canonical resource URL (`MCP_SERVER_URL` + `/mcp`), which clients send as the RFC 8707 `resource` parameter. Tokens for other resources are rejected. |
+| No token pass-through | This server | The Clerk token is never forwarded to LangSmith; LangSmith is called with a separate LangSmith API key (see below). |
+
+### 1. Configure Clerk
+
+In the [Clerk Dashboard](https://dashboard.clerk.com) → **OAuth applications** → **Settings** → *Client onboarding*:
+
+1. Enable **Publish CIMD support**. Clerk then advertises `client_id_metadata_document_supported: true` in its
+   authorization server metadata, and MCP clients can register with a Client ID Metadata Document.
+2. Optionally set **Client admission** to *Pre-registered clients only* and allow the client metadata URLs you trust.
+3. Leave **Publish DCR support** *off* (DCR is deprecated; CIMD-only is the goal). If an old client still needs DCR you can enable it, but the server logs a warning at startup when it is advertised.
+4. Make sure OAuth access tokens are issued as **JWTs** (the default for new instances; legacy applications can be switched from opaque tokens) and that the **audience (`aud`) claim** for OAuth access tokens is enabled so Clerk copies the RFC 8707 `resource` value into the token. Without an `aud` claim every token is rejected (the server logs the reason).
+
+Your Clerk **Frontend API URL** is the OAuth issuer: `https://clerk.<your-domain>` in production or
+`https://<slug>.clerk.accounts.dev` for development instances. Clerk publishes its metadata at
+`<issuer>/.well-known/oauth-authorization-server` and its keys at `<issuer>/.well-known/jwks.json`.
+
+### 2. Configure the server
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CLERK_ISSUER` | ✅ | Clerk Frontend API URL (the OAuth issuer). Setting it switches the HTTP transport to OAuth mode. |
+| `MCP_SERVER_URL` | ✅ | Public **https** base URL of this server, e.g. `https://mcp.example.com`. The canonical resource identifier and expected token audience is `MCP_SERVER_URL/mcp`. |
+| `MCP_AUTH_MODE` | ❌ | `oauth` (default when `CLERK_ISSUER` is set) or `api_key` (legacy header auth). |
+| `MCP_OAUTH_SCOPES_SUPPORTED` | ❌ | Scopes advertised in resource metadata and in the 401 challenge. Default `openid profile email`. |
+| `MCP_OAUTH_REQUIRED_SCOPES` | ❌ | Scopes a token must carry; otherwise `403 insufficient_scope`. Default none. |
+| `MCP_OAUTH_AUDIENCE` | ❌ | Override of accepted `aud` values (comma-separated). Default: the resource URL with and without trailing slash. |
+| `MCP_OAUTH_JWKS_URL` | ❌ | Default `CLERK_ISSUER/.well-known/jwks.json`. |
+| `MCP_OAUTH_PUBLIC_KEY` | ❌ | PEM public key instead of JWKS (offline/testing). |
+| `MCP_OAUTH_RESOURCE_DOCUMENTATION` | ❌ | Docs URL included in resource metadata. |
+| `MCP_OAUTH_STARTUP_CHECK` | ❌ | Default `true`: on startup the server fetches Clerk's metadata and logs warnings if PKCE `S256` or CIMD are not advertised, DCR is still enabled, or the issuer differs. |
+| `CLERK_SECRET_KEY` | ❌ | Clerk Backend API key. Enables verification of **opaque** `oat_` tokens and per-user LangSmith credentials (below). |
+| `CLERK_API_URL` | ❌ | Default `https://api.clerk.com`. |
+| `MCP_OAUTH_ALLOW_OPAQUE_TOKENS` | ❌ | Default `true` when `CLERK_SECRET_KEY` is set. |
+| `MCP_OAUTH_USER_CREDENTIALS_FROM_CLERK` | ❌ | Default `true` when `CLERK_SECRET_KEY` is set. |
+
+Minimal example (`.env` or container environment):
+
+```bash
+CLERK_ISSUER=https://clerk.example.com
+MCP_SERVER_URL=https://mcp.example.com
+LANGSMITH_API_KEY=lsv2_pt_...          # server-wide LangSmith key (see "Where the LangSmith key comes from")
+```
+
+### 3. Where the LangSmith key comes from
+
+OAuth proves *who* the caller is; LangSmith still needs an API key. For each tool call the server resolves it in this order:
+
+1. `LANGSMITH-API-KEY` request header (plus optional `LANGSMITH-WORKSPACE-ID` / `LANGSMITH-ENDPOINT`), if the client sends one.
+2. The authenticated Clerk user's **`private_metadata`** (`langsmith_api_key`, optional `langsmith_workspace_id`, `langsmith_endpoint`) — requires `CLERK_SECRET_KEY`. Lets each user bring their own LangSmith key without exposing it to the MCP client:
+   ```bash
+   curl -X PATCH https://api.clerk.com/v1/users/user_123/metadata \
+     -H "Authorization: Bearer $CLERK_SECRET_KEY" -H "Content-Type: application/json" \
+     -d '{"private_metadata": {"langsmith_api_key": "lsv2_pt_..."}}'
+   ```
+3. The server's `LANGSMITH_API_KEY` / `LANGSMITH_WORKSPACE_ID` / `LANGSMITH_ENDPOINT` environment variables (shared key for every authenticated user).
+
+### 4. Connect a client
+
+Point any OAuth-capable MCP client at `https://mcp.example.com/mcp` with **no headers**. The client receives a `401`
+with `resource_metadata`, reads `/.well-known/oauth-protected-resource/mcp`, discovers Clerk, registers via CIMD,
+runs the PKCE flow in the browser, and retries with `Authorization: Bearer …`. For example in Cursor:
+
+```json
+{
+  "mcpServers": {
+    "LangSmith MCP (OAuth)": { "url": "https://mcp.example.com/mcp" }
+  }
+}
+```
+
+Useful checks:
+
+```bash
+curl https://mcp.example.com/.well-known/oauth-protected-resource/mcp
+curl -i -X POST https://mcp.example.com/mcp -H 'Content-Type: application/json' -d '{}'   # → 401 + WWW-Authenticate
+curl https://clerk.example.com/.well-known/oauth-authorization-server | jq '.client_id_metadata_document_supported, .code_challenge_methods_supported, .registration_endpoint'
+```
+
+### Compliance notes
+
+- Only `Authorization: Bearer` is accepted (`bearer_methods_supported: ["header"]`); tokens in query strings are rejected.
+- `MCP_SERVER_URL` and `CLERK_ISSUER` must be `https` (plain `http` is only allowed for `localhost`).
+- The server does not host `/.well-known/oauth-authorization-server`; per the current spec clients must discover the authorization server through protected resource metadata. Clients written against the 2025-03-26 revision are not supported.
+- Dynamic Client Registration is neither implemented nor proxied by this server; whether Clerk accepts DCR is controlled solely by the Clerk *Publish DCR support* switch.
+
 ## 🐳 Docker Deployment (HTTP-Streamable)
 
 The LangSmith MCP Server can be deployed as an HTTP server using Docker, enabling remote access via the HTTP-streamable protocol.
@@ -275,9 +380,9 @@ The API key is provided via the `LANGSMITH-API-KEY` header when connecting, so n
 
 ### Connecting with HTTP-Streamable Protocol
 
-Once the Docker container is running, you can connect to it using the HTTP-streamable transport. The server accepts authentication via headers:
+Once the Docker container is running, you can connect to it using the HTTP-streamable transport. With OAuth configured (see [Authentication](#-authentication-oauth-21-with-clerk)) clients authenticate with a Clerk-issued bearer token and need no custom headers. In legacy `api_key` mode the server accepts authentication via headers:
 
-**Required header:**
+**Required header (api_key mode):**
 - `LANGSMITH-API-KEY`: Your LangSmith API key
 
 **Optional headers:**

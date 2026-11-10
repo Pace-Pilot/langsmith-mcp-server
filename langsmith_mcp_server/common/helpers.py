@@ -10,6 +10,11 @@ from uuid import UUID
 from fastmcp.server import Context
 from langsmith import Client
 
+from langsmith_mcp_server.auth.provider import (
+    get_active_settings,
+    resolve_oauth_user_credentials,
+)
+
 # Import context variables from middleware
 try:
     from langsmith_mcp_server.middleware import (
@@ -124,18 +129,31 @@ async def get_client_from_context(ctx: Context) -> Client:
             # Fall through to get from environment variables
             pass
 
+        # OAuth mode: credentials stored on the authenticated Clerk user (private_metadata)
+        if not api_key:
+            try:
+                user_creds = await resolve_oauth_user_credentials()
+            except Exception:
+                user_creds = None
+            if user_creds:
+                api_key = user_creds["api_key"]
+                workspace_id = user_creds.get("workspace_id") or None
+                endpoint = user_creds.get("endpoint") or None
+                await ctx.set_state("api_key", api_key)
+                if workspace_id:
+                    await ctx.set_state("workspace_id", workspace_id)
+                if endpoint:
+                    await ctx.set_state("endpoint", endpoint)
+
         # If still no api_key (either request was None or we caught exception), try environment
         if not api_key:
-            # STDIO transport: get from environment variables
+            # STDIO transport (or server-wide credentials in HTTP mode): environment variables
             api_key = os.environ.get("LANGSMITH_API_KEY")
             workspace_id = os.environ.get("LANGSMITH_WORKSPACE_ID") or None
             endpoint = os.environ.get("LANGSMITH_ENDPOINT") or None
 
     if not api_key:
-        raise ValueError(
-            "API key not found. For HTTP transport, provide LANGSMITH-API-KEY header. "
-            "For STDIO transport, set LANGSMITH_API_KEY environment variable."
-        )
+        raise ValueError(_missing_api_key_message())
 
     # Reuse the same Client within this request to avoid creating a new one per tool
     # call (reduces memory churn and connection buildup under load).
@@ -148,6 +166,21 @@ async def get_client_from_context(ctx: Context) -> Client:
     )
     await ctx.set_state(_cache_key, client, serializable=False)
     return client
+
+
+def _missing_api_key_message() -> str:
+    settings = get_active_settings()
+    if settings is not None and settings.oauth_enabled:
+        return (
+            "LangSmith API key not found for this request. In OAuth mode the server looks for, "
+            "in order: a LANGSMITH-API-KEY request header, 'langsmith_api_key' in the "
+            "authenticated Clerk user's private_metadata (requires CLERK_SECRET_KEY), then the "
+            "server's LANGSMITH_API_KEY environment variable."
+        )
+    return (
+        "API key not found. For HTTP transport, provide LANGSMITH-API-KEY header. "
+        "For STDIO transport, set LANGSMITH_API_KEY environment variable."
+    )
 
 
 async def get_api_key_and_endpoint_from_context(ctx: Context) -> tuple[str, str]:

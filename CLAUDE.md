@@ -57,12 +57,23 @@ register_resources(mcp)    # Currently empty stub
 - HTTP mode runs via uvicorn and is configured in the Dockerfile
 - **Client disconnect patch**: [streamable_http_patch.py](langsmith_mcp_server/streamable_http_patch.py) patches the MCP streamable HTTP transport so that when the client (or proxy) closes the connection early, the server logs and continues instead of crashing with `ClosedResourceError` / `BrokenResourceError` (see [Troubleshooting](#7-http-streamable-client-disconnect-crashes)).
 
-#### 2. Authentication & Middleware ([middleware.py](langsmith_mcp_server/middleware.py))
-Request-scoped authentication system that:
-- Extracts `LANGSMITH-API-KEY` header from requests
-- Supports optional `LANGSMITH-WORKSPACE-ID` and `LANGSMITH-ENDPOINT` headers
-- Stores credentials in context variables for access by tools
-- Returns 401 for missing API keys (except /health endpoint)
+#### 2. Authentication ([auth/](langsmith_mcp_server/auth/) + [middleware.py](langsmith_mcp_server/middleware.py))
+
+Two HTTP auth modes, selected by `MCP_AUTH_MODE` (defaults to `oauth` when `CLERK_ISSUER` is set, else `api_key`):
+
+**`oauth` mode — OAuth 2.1 resource server (MCP authorization spec 2026-07-28), Clerk as authorization server**
+- [auth/settings.py](langsmith_mcp_server/auth/settings.py): `OAuthSettings` / `load_auth_settings()` read and validate env (`CLERK_ISSUER`, `MCP_SERVER_URL`, scopes, audience, JWKS, optional `CLERK_SECRET_KEY`). Enforces https. Canonical resource = `MCP_SERVER_URL + /mcp`.
+- [auth/clerk.py](langsmith_mcp_server/auth/clerk.py): `ClerkAccessTokenVerifier` (subclass of FastMCP `JWTVerifier`): verifies Clerk JWT access tokens against Clerk's JWKS — signature, `iss`, `exp`, **`aud` must contain the resource URL** (RFC 8707). Optional opaque `oat_` token verification via Clerk Backend API when `CLERK_SECRET_KEY` is set. Required scopes are *not* checked here (so missing scopes yield 403, not 401). `ClerkUserCredentialResolver` optionally maps the user's `sub` to LangSmith credentials in Clerk `private_metadata`.
+- [auth/provider.py](langsmith_mcp_server/auth/provider.py): `ClerkResourceServerAuthProvider` (FastMCP `RemoteAuthProvider`) serves RFC 9728 metadata at `/.well-known/oauth-protected-resource/mcp` with exact issuer strings; `server.py` adds a root-level copy. `ScopeChallengeMiddleware` appends `scope="…"` to 401 `WWW-Authenticate` challenges. `check_authorization_server()` runs in the FastMCP lifespan and warns when Clerk's metadata lacks PKCE `S256` / `client_id_metadata_document_supported`, still advertises a DCR `registration_endpoint`, or the issuer mismatches. `resolve_oauth_user_credentials()` is used by helpers.
+- FastMCP's built-in `RequireAuthMiddleware` returns `401 invalid_token` (+ `resource_metadata`) and `403 insufficient_scope` for `/mcp`.
+- Everything AS-side (PKCE, CIMD client registration, consent, token issuance) is Clerk's responsibility; the server never issues tokens and never forwards the Clerk token to LangSmith.
+
+**`api_key` mode — legacy header auth**
+- `LANGSMITH-API-KEY` header required (401 otherwise).
+
+**Middleware ([middleware.py](langsmith_mcp_server/middleware.py)) — both modes**
+- `LangSmithCredentialsMiddleware` (alias `APIKeyMiddleware`) extracts `LANGSMITH-API-KEY`, `LANGSMITH-WORKSPACE-ID`, `LANGSMITH-ENDPOINT` into context variables (header is optional in oauth mode)
+- Lets `/health` and `/.well-known/*` through unauthenticated; returns 405 for non-POST/DELETE on `/mcp`
 - Sets **session/thread id** for monitoring: from `mcp-session-id`, `x-session-id`, or `x-request-id` header, or a generated UUID per request
 - Automatically cleans up context after each request
 
@@ -86,7 +97,7 @@ Each tool execution is logged with `run_type="tool"` via LangSmith's `@traceable
 #### 3. Client Management ([common/helpers.py](langsmith_mcp_server/common/helpers.py))
 Helper functions for LangSmith client creation and management:
 - `get_langsmith_client_from_api_key()`: Creates Client instances from API keys (no `os.environ` mutation; credentials passed explicitly to avoid cross-request races)
-- `get_client_from_context()`: Retrieves client from FastMCP context; reuses one Client per request via request-scoped state to reduce memory churn
+- `get_client_from_context()`: Retrieves client from FastMCP context; reuses one Client per request via request-scoped state to reduce memory churn. Credential resolution order: session state → `LANGSMITH-API-KEY` header → (oauth mode) Clerk user `private_metadata` via `resolve_oauth_user_credentials()` → `LANGSMITH_API_KEY` env
 - `get_api_key_and_endpoint_from_context()`: Extracts credentials from context
 - No custom wrapper class - uses standard `langsmith.Client` directly
 
@@ -158,6 +169,7 @@ All tools are registered in [register_tools.py](langsmith_mcp_server/services/re
   - `fetch_trace_tool()` - exists but not exposed as MCP tool
   - `get_project_runs_stats_tool()` - exists but not exposed as MCP tool
 - All tools use `ctx: Context` parameter to access API keys from middleware
+- In OAuth mode the caller's identity is available via `fastmcp.server.dependencies.get_access_token()` (claims include `sub`); `auth/provider.get_oauth_subject()` wraps it
 
 ---
 
@@ -451,9 +463,13 @@ usage = get_billing_usage(
 ```
 langsmith-mcp-server/
 ├── langsmith_mcp_server/
-│   ├── server.py                 # Main MCP server, FastMCP app, HTTP/stdio setup
+│   ├── server.py                 # Main MCP server (create_mcp_server/create_app), HTTP/stdio setup
 │   ├── streamable_http_patch.py  # Client-disconnect handling for HTTP streamable transport
-│   ├── middleware.py            # API key authentication middleware
+│   ├── middleware.py            # LangSmith credential headers middleware (api_key mode: required)
+│   ├── auth/
+│   │   ├── settings.py           # OAuthSettings / load_auth_settings() (env → validated config)
+│   │   ├── clerk.py              # Clerk JWT/opaque token verifier, per-user credential resolver
+│   │   └── provider.py           # RFC 9728 metadata provider, scope challenge, AS self-check
 │   ├── monitoring.py             # Optional: trace tool calls to second LangSmith (session_id, run_type=tool)
 │   ├── common/
 │   │   ├── helpers.py            # Client creation, UUID conversion, utilities
@@ -475,6 +491,7 @@ langsmith-mcp-server/
 ├── tests/
 │   ├── tools/
 │   │   └── test_dataset_tools.py
+│   ├── test_oauth_auth.py        # OAuth resource-server tests (offline, RSA test keys)
 │   └── test_mock.py
 ├── examples/                     # Example scripts showing tool usage
 │   ├── fetch_runs.py
@@ -496,9 +513,17 @@ langsmith-mcp-server/
 ### Common Issues
 
 1. **API Key Problems**
-   - Error: "Missing LANGSMITH-API-KEY header" (HTTP) or client initialization failures (stdio)
+   - Error: "Missing LANGSMITH-API-KEY header" (HTTP, api_key mode) or client initialization failures (stdio)
    - Solution: Ensure `LANGSMITH_API_KEY` is set in environment or headers
    - Verify key format: should start with `lsv2_pt_`
+   - OAuth mode: "LangSmith API key not found for this request" means neither the header, the Clerk user's `private_metadata.langsmith_api_key` (needs `CLERK_SECRET_KEY`), nor the server env provided a key
+
+1b. **OAuth Problems (Clerk)**
+   - Every token rejected with 401 and a log line about a missing `aud` claim → enable the audience (`aud`) claim for OAuth access tokens in Clerk so tokens carry the RFC 8707 `resource`; `aud` must equal `MCP_SERVER_URL/mcp`
+   - Clients cannot register → in Clerk: OAuth applications → Settings → Client onboarding → enable *Publish CIMD support* (startup self-check warns when `client_id_metadata_document_supported` is absent)
+   - Startup warning about `registration_endpoint` → DCR is still enabled in Clerk; disable *Publish DCR support* for CIMD-only
+   - Non-JWT (`oat_`) tokens rejected → switch the Clerk OAuth application to JWT access tokens, or set `CLERK_SECRET_KEY` to allow opaque-token verification
+   - Tests run offline with `MCP_OAUTH_PUBLIC_KEY`-style configuration (see `tests/test_oauth_auth.py`)
 
 2. **Import Errors**
    - Error: Module not found
@@ -608,6 +633,11 @@ langsmith-mcp-server/
 ---
 
 ## Recent Architecture Changes
+
+### OAuth 2.1 resource server with Clerk (November 2026)
+- **Added**: `langsmith_mcp_server/auth/` package; `server.py` factories `create_mcp_server()` / `create_app()`
+- **Spec**: MCP authorization 2026-07-28 — RFC 9728 protected resource metadata, RFC 8707 audience validation, 401/403 challenges with `resource_metadata` and `scope`, PKCE-only authorization code flow and CIMD client registration handled by Clerk (DCR deprecated)
+- **Compatibility**: `api_key` header mode remains and is the default when `CLERK_ISSUER` is unset; stdio transport unchanged
 
 ### Unified Pagination in fetch_runs (February 2025)
 - **Removed**: `paginate_runs` tool (was redundant - required trace_id)
